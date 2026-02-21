@@ -189,6 +189,7 @@ class DiT(nn.Module):
         patch_size: int,
         ratio: float = 0.75,
         context_dim: int | None = None,
+        toks_dim: int | None = None,
         flow: bool = False,
         **kwargs,
     ):
@@ -218,10 +219,8 @@ class DiT(nn.Module):
             nn.Linear(embed_dim, 2 * embed_dim, bias=True),
         )
 
-        if context_dim:
-            self.context_project = nn.Linear(context_dim, embed_dim)
-        else:
-            self.context_project = False
+        self.context_project = nn.Linear(context_dim, embed_dim) if context_dim else None
+        self.toks_project = nn.Linear(toks_dim, embed_dim) if toks_dim else None
 
         # Zero-initialize final layer
         nn.init.zeros_(self.final_adaLN[-1].weight)
@@ -249,10 +248,10 @@ class DiT(nn.Module):
         toks = self.tokenizer(x_t)
 
         # Concatenate all tokens for self-attention
-        if isinstance(self.context_project, nn.Module):
+        if self.context_project is not None:
             c = self.context_project(c)
-            if x_i_toks is not None:
-                x_i_toks = self.context_project(x_i_toks)
+        if self.toks_project is not None and x_i_toks is not None:
+            x_i_toks = self.toks_project(x_i_toks)
 
         if x_i_toks is not None:
             h = torch.cat([c, x_i_toks, toks], dim=-2)

@@ -77,19 +77,19 @@ class Config:
     query_dim: int
     value_dim: int
     ffn_dim: int
-    latent_tokens: int
     # Flow DiT
     flow_layers: int
     flow_embed_dim: int
     flow_query_dim: int
     flow_value_dim: int
     flow_ffn_dim: int
+    compression_factor: int = 4
     flow_steps: int = 100
     flow_ratio: float = 0.75
     # Sphere noise: σ = tan(α), α jittered from angle ranges (Appendix D)
     sigma_angle_max: float = 80.0  # degrees, upper bound of normal range
     sigma_mix_max: float = 85.0  # degrees, upper bound of overflow range
-    sigma_mix_prob: float = 0.5  # prob of sampling from overflow range
+    sigma_mix_prob: float = 0.1  # prob of sampling from overflow range
     # Loss weights (Appendix D values)
     w_l1_recon: float = 1.0
     w_perc_recon: float = 1.0
@@ -118,7 +118,6 @@ CIFAR10_CFG = Config(
     query_dim=32,
     value_dim=32,
     ffn_dim=512,
-    latent_tokens=4,
     flow_layers=6,
     flow_embed_dim=256,
     flow_query_dim=32,
@@ -150,8 +149,7 @@ IMAGENET_CFG = Config(
     num_heads=8,
     query_dim=64,
     value_dim=64,
-    ffn_dim=1536,
-    latent_tokens=64,
+    ffn_dim=3072,
     flow_layers=12,
     flow_embed_dim=768,
     flow_query_dim=64,
@@ -161,11 +159,11 @@ IMAGENET_CFG = Config(
     sigma_mix_max=89.0,
     w_l1_recon=50.0,
     w_perc_recon=1.0,
-    w_l1_con=25.0,
+    w_l1_con=50.0,
     w_perc_con=1.0,
     w_lat_con=0.5,
     w_flow=1.0,
-    batch_size=192,
+    batch_size=128,
     lr=3e-3,
     total_steps=500_000,
     ae_warmup_steps=10_000,
@@ -232,13 +230,13 @@ class SphereAE(nn.Module):
         self.tok = Tokenizer((C, H, H), cfg.patch_size, cfg.embed_dim)
         self.enc = Encoder(
             cfg.ae_layers,
-            cfg.latent_tokens,
             self.num_patches,
             cfg.num_heads,
             cfg.embed_dim,
             cfg.query_dim,
             cfg.value_dim,
             cfg.ffn_dim,
+            cfg.compression_factor,
         )
         self.dec = Decoder(
             cfg.ae_layers,
@@ -248,10 +246,11 @@ class SphereAE(nn.Module):
             cfg.query_dim,
             cfg.value_dim,
             cfg.ffn_dim,
+            cfg.compression_factor,
         )
-        self.lat = cfg.latent_tokens
-        self.dim = cfg.embed_dim
-        self.L = cfg.latent_tokens * cfg.embed_dim
+        self.lat = self.num_patches
+        self.dim = cfg.embed_dim // cfg.compression_factor
+        self.L = self.num_patches * self.dim
 
     def encode(self, x: Tensor) -> tuple[Tensor, Tensor]:
         """Returns (z_flat, v): raw flat latent and sphere-projected latent."""
@@ -292,7 +291,7 @@ class SphereFlowTrainer(nn.Module):
 
     Sphere AE produces an initial decode x_0 from the spherical latent.
     The DiT flow model then refines x_0 → x, conditioned on:
-      c        = sphere latent tokens  (b, latent_tokens, embed_dim)
+      c        = sphere latent tokens  (b, num_patches, latent_dim)
       x_i_toks = AE decoder output tokens (b, num_patches, embed_dim)
     """
 
@@ -311,7 +310,8 @@ class SphereFlowTrainer(nn.Module):
             img_chw=(C, H, H),
             patch_size=cfg.patch_size,
             ratio=cfg.flow_ratio,
-            context_dim=cfg.embed_dim,
+            context_dim=cfg.embed_dim // cfg.compression_factor,
+            toks_dim=cfg.embed_dim,
             flow=True,
         )
         self.cfg = cfg
@@ -342,6 +342,8 @@ class SphereFlowTrainer(nn.Module):
             l1_r=l1_r.detach(),
             perc_r=perc_r.detach(),
             L_lat=L_lat.detach(),
+            l1_c=l1_c.detach(),
+            perc_c=perc_c.detach(),
         )
 
         if not train_flow:
@@ -431,6 +433,7 @@ def get_loader(cfg: Config) -> DataLoader:
         num_workers=4,
         pin_memory=True,
         drop_last=True,
+        multiprocessing_context="fork",
     )
 
 
@@ -494,7 +497,7 @@ def train(cfg: Config, run_name: str, use_wandb: bool, save_artifacts: bool = Tr
         "model": {
             "ae_layers": cfg.ae_layers,
             "embed_dim": cfg.embed_dim,
-            "latent_tokens": cfg.latent_tokens,
+            "compression_factor": cfg.compression_factor,
             "flow_layers": cfg.flow_layers,
         },
         "training": {

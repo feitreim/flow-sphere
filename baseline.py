@@ -271,7 +271,7 @@ def get_loader(cfg: Config) -> DataLoader:
         ds = _HFWrapper()
     else:
         assert False, f"Unknown dataset: {cfg.dataset}"
-    return DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+    return DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True, multiprocessing_context="fork")
 
 
 # ── Optimizers ────────────────────────────────────────────────────────────────────

@@ -49,6 +49,41 @@ class RMSNorm(nn.Module):
         return x * rms * self.weight
 
 
+class MLPMixerLayer(nn.Module):
+    def __init__(self, num_tokens: int, embed_dim: int):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.token_fc1 = nn.Linear(num_tokens, num_tokens * 4)
+        self.token_fc2 = nn.Linear(num_tokens * 4, num_tokens)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.channel_fc1 = nn.Linear(embed_dim, embed_dim * 4)
+        self.channel_fc2 = nn.Linear(embed_dim * 4, embed_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # token mixing
+        h = self.norm1(x).transpose(1, 2)  # (b, dim, tokens)
+        h = self.token_fc2(F.gelu(self.token_fc1(h))).transpose(1, 2)
+        x = x + h
+        # channel mixing
+        h = self.norm2(x)
+        h = self.channel_fc2(F.gelu(self.channel_fc1(h)))
+        return x + h
+
+
+class MLPMixer(nn.Module):
+    """4-layer MLP-Mixer with final RMSNorm, inserted at encoder end and decoder start."""
+
+    def __init__(self, num_tokens: int, embed_dim: int, num_layers: int = 4):
+        super().__init__()
+        self.layers = nn.ModuleList([MLPMixerLayer(num_tokens, embed_dim) for _ in range(num_layers)])
+        self.norm = RMSNorm(embed_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return self.norm(x)
+
+
 class ViTLayer(nn.Module):
     def __init__(
         self,
@@ -104,7 +139,7 @@ class Tokenizer(nn.Module):
     """Patchify and unpatchify images for DiT."""
 
     def __init__(
-        self, img_chw: tuple[int, int, int], patch_size: int, embed_dim: int
+        self, img_chw: tuple[int, int, int], patch_size: int, embed_dim: int, bottleneck_dim: int = 128
     ) -> None:
         super().__init__()
         num_patches = (img_chw[1] // patch_size) * (img_chw[2] // patch_size)
@@ -113,7 +148,8 @@ class Tokenizer(nn.Module):
         self.unfold = nn.Unfold(**params)
         self.fold = nn.Fold(output_size=img_chw[1:], **params)
         patch_dim = patch_size * patch_size * img_chw[0]
-        self.to_tokens = nn.Linear(patch_dim, embed_dim, bias=False)
+        self.bottleneck = nn.Linear(patch_dim, bottleneck_dim, bias=False)
+        self.to_tokens = nn.Linear(bottleneck_dim, embed_dim, bias=False)
         self.out_norm = nn.LayerNorm(embed_dim)
         self.from_tokens = nn.Linear(embed_dim, patch_dim, bias=False)
         self.positional = init_param(1, num_patches, embed_dim)
@@ -129,6 +165,7 @@ class Tokenizer(nn.Module):
     def tokenize(self, inputs: Tensor) -> Tensor:
         patches = self.unfold(inputs)
         patches = rearrange(patches, "b p t -> b t p")
+        patches = self.bottleneck(patches)
         tokens = self.to_tokens(patches)
         return tokens
 
@@ -152,66 +189,64 @@ class Encoder(nn.Module):
     def __init__(
         self,
         num_layers: int,
-        latent_tokens: int,
         input_tokens: int,
         heads: int,
         embed_dim: int,
         query_dim: int,
         value_dim: int,
         ffn_dim: int,
+        compression_factor: int = 4,
     ):
         super().__init__()
         layers = []
         for _ in range(num_layers):
             layers.append(ViTLayer(heads, embed_dim, query_dim, value_dim, ffn_dim))
         self.layers = nn.ModuleList(layers)
-        self.latent_tokens = init_param(latent_tokens, embed_dim)
         self.positional_enc = init_param(input_tokens, embed_dim)
+        self.mixer = MLPMixer(input_tokens, embed_dim)
+        self.bottleneck = nn.Linear(embed_dim, embed_dim // compression_factor, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        bsz, seq = x.shape[:2]
-        latent_tokens = self.latent_tokens.expand(bsz, -1, -1)
-        pos_enc = self.positional_enc.expand(bsz, -1, -1)
-        x = x + pos_enc
-        h = torch.cat([x, latent_tokens], dim=-2)
+        h = x + self.positional_enc[None, ...]
         for layer in self.layers:
             h = layer(h)
-        return h[:, seq:]
+        h = self.mixer(h)
+        return self.bottleneck(h)
 
 
 class Decoder(nn.Module):
     def __init__(
         self,
         num_layers: int,
-        output_tokens: int,
+        num_tokens: int,
         heads: int,
         embed_dim: int,
         query_dim: int,
         value_dim: int,
         ffn_dim: int,
+        compression_factor: int = 4,
     ):
         super().__init__()
         layers = []
         for _ in range(num_layers):
             layers.append(ViTLayer(heads, embed_dim, query_dim, value_dim, ffn_dim))
         self.layers = nn.ModuleList(layers)
-        self.output_tokens = init_param(output_tokens, embed_dim)
+        self.un_bottleneck = nn.Linear(embed_dim // compression_factor, embed_dim, bias=False)
+        self.mixer = MLPMixer(num_tokens, embed_dim)
 
     def forward(self, x: Tensor) -> Tensor:
-        bsz, seq = x.shape[:2]
-        output_tokens = self.output_tokens.expand(bsz, -1, -1)
-        h = torch.cat([x, output_tokens], dim=-2)
+        h = self.un_bottleneck(x)
+        h = self.mixer(h)
         for layer in self.layers:
             h = layer(h)
-        return h[:, seq:]
+        return h
 
 
 class AE(nn.Module):
     def __init__(
         self,
         num_layers: int,
-        latent_tokens: int,
-        output_tokens: int,
+        num_tokens: int,
         heads: int,
         embed_dim: int,
         query_dim: int,
@@ -219,26 +254,28 @@ class AE(nn.Module):
         ffn_dim: int,
         img_chw: tuple[int, int, int],
         patch_size: int,
+        compression_factor: int = 4,
     ):
         super().__init__()
         self.encoder = Encoder(
             num_layers,
-            latent_tokens,
-            output_tokens,
+            num_tokens,
             heads,
             embed_dim,
             query_dim,
             value_dim,
             ffn_dim,
+            compression_factor,
         )
         self.decoder = Decoder(
             num_layers,
-            output_tokens,
+            num_tokens,
             heads,
             embed_dim,
             query_dim,
             value_dim,
             ffn_dim,
+            compression_factor,
         )
         self.tokenizer = Tokenizer(img_chw, patch_size, embed_dim)
 
