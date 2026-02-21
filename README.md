@@ -1,4 +1,4 @@
-# Sphere Flow
+# Spherical Flow
 
 Implementation of a spherical autoencoder with flow-based refinement for image generation, based on:
 

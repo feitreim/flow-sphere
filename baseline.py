@@ -70,7 +70,7 @@ class Config:
     latent_tokens: int
     sigma_angle_max: float = 80.0
     sigma_mix_max: float = 85.0
-    sigma_mix_prob: float = 0.1
+    sigma_mix_prob: float = 0.2
     w_l1_recon: float = 1.0
     w_perc_recon: float = 1.0
     w_l1_con: float = 0.5
@@ -88,7 +88,7 @@ CIFAR10_CFG = Config(
     dataset="cifar10",
     data_dir="./data",
     img_size=32,
-    patch_size=4,
+    patch_size=12,
     ae_layers=6,
     embed_dim=256,
     num_heads=8,
@@ -96,15 +96,14 @@ CIFAR10_CFG = Config(
     value_dim=32,
     ffn_dim=512,
     latent_tokens=1,
-    sigma_angle_max=80.0,
+    sigma_angle_max=85.0,
     sigma_mix_max=85.0,
-    sigma_mix_prob=0.1,
     w_l1_recon=1.0,
     w_perc_recon=1.0,
-    w_l1_con=0.5,
-    w_perc_con=0.5,
-    w_lat_con=0.1,
-    batch_size=1280,
+    w_l1_con=1.0,
+    w_perc_con=1.0,
+    w_lat_con=0.5,
+    batch_size=256,
     lr=3e-3,
     total_steps=100_000,
 )
@@ -123,12 +122,11 @@ IMAGENET_CFG = Config(
     latent_tokens=4,
     sigma_angle_max=85.0,
     sigma_mix_max=89.0,
-    sigma_mix_prob=0.1,
     w_l1_recon=50.0,
     w_perc_recon=1.0,
     w_l1_con=25.0,
     w_perc_con=1.0,
-    w_lat_con=0.1,
+    w_lat_con=0.5,
     batch_size=256,
     lr=4e-4,
     total_steps=500_000,
@@ -319,7 +317,7 @@ def train(cfg: Config, run_name: str, use_wandb: bool, save_artifacts: bool = Tr
         "training": {"lr": cfg.lr, "total_steps": cfg.total_steps},
     }
     LoggerCls = WandbLogger if use_wandb else Logger
-    logger = LoggerCls(project="sphere-ae", name=run_name, config=logger_cfg, device=device)
+    logger = LoggerCls(project="sphere-flow", name=run_name, config=logger_cfg, device=device)
     logger.log_args(logger_cfg)
     logger.setup_fid(loader, cache_path=f"./fid_cache/{cfg.dataset}_fid_stats.pt")
 

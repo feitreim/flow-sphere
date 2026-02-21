@@ -89,7 +89,7 @@ class Config:
     # Sphere noise: σ = tan(α), α jittered from angle ranges (Appendix D)
     sigma_angle_max: float = 80.0  # degrees, upper bound of normal range
     sigma_mix_max: float = 85.0  # degrees, upper bound of overflow range
-    sigma_mix_prob: float = 0.1  # prob of sampling from overflow range
+    sigma_mix_prob: float = 0.5  # prob of sampling from overflow range
     # Loss weights (Appendix D values)
     w_l1_recon: float = 1.0
     w_perc_recon: float = 1.0
@@ -118,7 +118,7 @@ CIFAR10_CFG = Config(
     query_dim=32,
     value_dim=32,
     ffn_dim=512,
-    latent_tokens=1,
+    latent_tokens=4,
     flow_layers=6,
     flow_embed_dim=256,
     flow_query_dim=32,
@@ -129,14 +129,15 @@ CIFAR10_CFG = Config(
     sigma_mix_prob=0.1,
     w_l1_recon=1.0,
     w_perc_recon=1.0,
-    w_l1_con=0.5,
-    w_perc_con=0.5,
+    w_l1_con=1.0,
+    w_perc_con=1.0,
     w_lat_con=0.1,
     w_flow=1.0,
     batch_size=1280,
-    lr=3e-3,
+    lr=6e-4,
     total_steps=100_000,
     ae_warmup_steps=10_000,
+    image_every=250,
 )
 
 IMAGENET_CFG = Config(
@@ -144,13 +145,13 @@ IMAGENET_CFG = Config(
     data_dir="",
     img_size=256,
     patch_size=16,
-    ae_layers=4,
+    ae_layers=6,
     embed_dim=768,
     num_heads=8,
     query_dim=64,
     value_dim=64,
     ffn_dim=1536,
-    latent_tokens=4,
+    latent_tokens=64,
     flow_layers=12,
     flow_embed_dim=768,
     flow_query_dim=64,
@@ -158,17 +159,17 @@ IMAGENET_CFG = Config(
     flow_ffn_dim=2048,
     sigma_angle_max=85.0,
     sigma_mix_max=89.0,
-    sigma_mix_prob=0.1,
     w_l1_recon=50.0,
     w_perc_recon=1.0,
     w_l1_con=25.0,
     w_perc_con=1.0,
-    w_lat_con=0.1,
+    w_lat_con=0.5,
     w_flow=1.0,
-    batch_size=256,
-    lr=4e-4,
+    batch_size=192,
+    lr=3e-3,
     total_steps=500_000,
     ae_warmup_steps=10_000,
+    image_every=500,
 )
 
 
@@ -180,12 +181,8 @@ class PerceptualLoss(nn.Module):
         self.features = nn.Sequential(*list(vgg.features.children())[:16])
         for p in self.parameters():
             p.requires_grad_(False)
-        self.register_buffer(
-            "mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        )
-        self.register_buffer(
-            "std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-        )
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def forward(self, x: Tensor, y: Tensor) -> Tensor:
         def prep(t: Tensor) -> Tensor:
@@ -319,9 +316,7 @@ class SphereFlowTrainer(nn.Module):
         )
         self.cfg = cfg
 
-    def forward(
-        self, x: Tensor, perceptual: PerceptualLoss, train_flow: bool = True
-    ) -> tuple[Tensor, dict]:
+    def forward(self, x: Tensor, perceptual: PerceptualLoss, train_flow: bool = True) -> tuple[Tensor, dict]:
         cfg = self.cfg
         v, v_noisy, v_NOISY, x_noisy, x_NOISY, dec_toks = self.ae(x, cfg)
 
@@ -352,7 +347,7 @@ class SphereFlowTrainer(nn.Module):
         if not train_flow:
             return ae_loss, info
 
-        # ── Flow loss (x-prediction, FlowTrainer-style) ───────────────────────
+        # ── Flow loss (x-prediction, JiT-style) ───────────────────────
         b = x.shape[0]
         c = v_noisy.reshape(b, self.ae.lat, self.ae.dim)  # sphere latent as tokens
         # start from ratio*noise + (1-ratio)*x_0, flow toward x
@@ -397,12 +392,8 @@ class SphereFlowTrainer(nn.Module):
 # ── Dataset ──────────────────────────────────────────────────────────────────────
 def get_loader(cfg: Config) -> DataLoader:
     if cfg.dataset == "cifar10":
-        tf = T.Compose(
-            [T.RandomHorizontalFlip(), T.ToTensor(), T.Normalize([0.5] * 3, [0.5] * 3)]
-        )
-        ds = torchvision.datasets.CIFAR10(
-            cfg.data_dir, train=True, download=True, transform=tf
-        )
+        tf = T.Compose([T.RandomHorizontalFlip(), T.ToTensor(), T.Normalize([0.5] * 3, [0.5] * 3)])
+        ds = torchvision.datasets.CIFAR10(cfg.data_dir, train=True, download=True, transform=tf)
     elif cfg.dataset == "imagenet":
         import datasets as hf
 
@@ -444,9 +435,7 @@ def get_loader(cfg: Config) -> DataLoader:
 
 
 # ── Optimizers ───────────────────────────────────────────────────────────────────
-def make_optimizers(
-    model: SphereFlowTrainer, cfg: Config
-) -> tuple[torch.optim.Muon, torch.optim.AdamW]:
+def make_optimizers(model: SphereFlowTrainer, cfg: Config) -> tuple[torch.optim.Muon, torch.optim.AdamW]:
     """
     torch.optim.Muon for all 2D weight matrices (linear layer weights).
     AdamW for embeddings, positional encodings, layernorm params, biases.
@@ -473,9 +462,7 @@ def make_optimizers(
     return muon, adamw
 
 
-def cosine_lr(
-    step: int, total: int, warmup: int, base_lr: float, min_lr: float = 1e-6
-) -> float:
+def cosine_lr(step: int, total: int, warmup: int, base_lr: float, min_lr: float = 1e-6) -> float:
     if step < warmup:
         return base_lr * step / max(warmup, 1)
     p = (step - warmup) / max(total - warmup, 1)
@@ -484,13 +471,7 @@ def cosine_lr(
 
 # ── Training ─────────────────────────────────────────────────────────────────────
 def train(cfg: Config, run_name: str, use_wandb: bool, save_artifacts: bool = True):
-    device = (
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu"
-    )
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     loader = get_loader(cfg)
     model = SphereFlowTrainer(cfg).to(device)
@@ -523,18 +504,14 @@ def train(cfg: Config, run_name: str, use_wandb: bool, save_artifacts: bool = Tr
         },
     }
     LoggerCls = WandbLogger if use_wandb else Logger
-    logger = LoggerCls(
-        project="sphere-flow", name=run_name, config=logger_cfg, device=device
-    )
+    logger = LoggerCls(project="sphere-flow", name=run_name, config=logger_cfg, device=device)
     logger.log_args(logger_cfg)
     logger.setup_fid(loader, cache_path=f"./fid_cache/{cfg.dataset}_fid_stats.pt")
 
     n_ae = sum(p.numel() for p in model.ae.parameters())
     n_flow = sum(p.numel() for p in model.flow.parameters())
     print(f"[sphere_flow] run={run_name}  dataset={cfg.dataset}  device={device}")
-    print(
-        f"[sphere_flow] ae={n_ae / 1e6:.1f}M  flow={n_flow / 1e6:.1f}M  ae_warmup={cfg.ae_warmup_steps}"
-    )
+    print(f"[sphere_flow] ae={n_ae / 1e6:.1f}M  flow={n_flow / 1e6:.1f}M  ae_warmup={cfg.ae_warmup_steps}")
 
     class SaveArgs:
         name = run_name
@@ -583,9 +560,7 @@ def train(cfg: Config, run_name: str, use_wandb: bool, save_artifacts: bool = Tr
                 ae_samples, samples = model.generate(8, device, N=10)
                 _, v = model.ae.encode(x[:8])
                 x_recon, _ = model.ae.decode(v)
-            mk = lambda imgs: torchvision.utils.make_grid(
-                imgs, nrow=8, normalize=True, value_range=(-1, 1)
-            )
+            mk = lambda imgs: torchvision.utils.make_grid(imgs, nrow=8, normalize=True, value_range=(-1, 1))
             logger.log_image(
                 "train/recon",
                 mk(torch.cat([x[:8], x_recon.clamp(-1, 1)])),
@@ -611,9 +586,7 @@ def train(cfg: Config, run_name: str, use_wandb: bool, save_artifacts: bool = Tr
                 logger.log("val", {"fid": fid})
             if save_artifacts:
                 logger.save_model(model, SaveArgs)
-            pbar.write(
-                f"[sphere_flow] ckpt step={step}" + (f"  fid={fid:.2f}" if fid else "")
-            )
+            pbar.write(f"[sphere_flow] ckpt step={step}" + (f"  fid={fid:.2f}" if fid else ""))
 
         phase_str = "ae+flow" if train_flow else "ae"
         pbar.set_postfix(loss=f"{loss.item():.4f}", phase=phase_str, lr=f"{lr:.2e}")
@@ -658,21 +631,11 @@ def run_sweep(count: int):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "dataset", nargs="?", default="cifar10", choices=["cifar10", "imagenet"]
-    )
-    parser.add_argument(
-        "--wandb", action="store_true", help="use WandbLogger instead of console Logger"
-    )
-    parser.add_argument(
-        "--run-name", default=None, help="run name for logging and checkpoints"
-    )
-    parser.add_argument(
-        "--sweep", action="store_true", help="run a wandb LR sweep on cifar10"
-    )
-    parser.add_argument(
-        "--sweep-count", type=int, default=10, help="number of sweep trials"
-    )
+    parser.add_argument("dataset", nargs="?", default="cifar10", choices=["cifar10", "imagenet"])
+    parser.add_argument("--wandb", action="store_true", help="use WandbLogger instead of console Logger")
+    parser.add_argument("--run-name", default=None, help="run name for logging and checkpoints")
+    parser.add_argument("--sweep", action="store_true", help="run a wandb LR sweep on cifar10")
+    parser.add_argument("--sweep-count", type=int, default=10, help="number of sweep trials")
     args = parser.parse_args()
 
     if args.sweep:
