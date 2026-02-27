@@ -51,7 +51,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from logger import Logger, WandbLogger
-from normal_autoencoder import Decoder, Encoder, Tokenizer
+from autoencoder import Decoder, Encoder, Tokenizer
 
 
 # ── Config ───────────────────────────────────────────────────────────────────────
@@ -68,6 +68,7 @@ class Config:
     value_dim: int
     ffn_dim: int
     latent_tokens: int
+    use_bn: bool = True  # BN on encoder output before spherify (Appendix C.3)
     sigma_angle_max: float = 80.0
     sigma_mix_max: float = 85.0
     sigma_mix_prob: float = 0.2
@@ -96,6 +97,7 @@ CIFAR10_CFG = Config(
     value_dim=32,
     ffn_dim=512,
     latent_tokens=1,
+    use_bn=True,
     sigma_angle_max=85.0,
     sigma_mix_max=85.0,
     w_l1_recon=1.0,
@@ -120,6 +122,7 @@ IMAGENET_CFG = Config(
     value_dim=64,
     ffn_dim=1536,
     latent_tokens=4,
+    use_bn=False,
     sigma_angle_max=85.0,
     sigma_mix_max=89.0,
     w_l1_recon=50.0,
@@ -196,10 +199,13 @@ class SphereAE(nn.Module):
         self.lat = cfg.latent_tokens
         self.dim = cfg.embed_dim
         self.L = cfg.latent_tokens * cfg.embed_dim
+        self.bn = nn.BatchNorm1d(self.L) if cfg.use_bn else None
 
     def encode(self, x: Tensor) -> tuple[Tensor, Tensor]:
         z = self.enc(self.tok(x))
         z_flat = z.reshape(z.shape[0], -1)
+        if self.bn is not None:
+            z_flat = self.bn(z_flat)
         return z_flat, spherify(z_flat)
 
     def decode(self, v_flat: Tensor) -> Tensor:

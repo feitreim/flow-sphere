@@ -58,9 +58,9 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from autoencoder import Decoder, Encoder, Tokenizer
 from dit import DiT
 from logger import Logger, WandbLogger
-from normal_autoencoder import Decoder, Encoder, Tokenizer
 
 
 # ── Config ──────────────────────────────────────────────────────────────────────
@@ -86,6 +86,7 @@ class Config:
     compression_factor: int = 4
     flow_steps: int = 100
     flow_ratio: float = 0.75
+    use_bn: bool = True  # BN on encoder output before spherify (Appendix C.3)
     # Sphere noise: σ = tan(α), α jittered from angle ranges (Appendix D)
     sigma_angle_max: float = 80.0  # degrees, upper bound of normal range
     sigma_mix_max: float = 85.0  # degrees, upper bound of overflow range
@@ -98,7 +99,7 @@ class Config:
     w_lat_con: float = 0.1
     w_flow: float = 1.0
     # Training
-    batch_size: int = 1280
+    batch_size: int = 128
     lr: float = 1e-4
     total_steps: int = 100_000
     ae_warmup_steps: int = 10_000
@@ -111,13 +112,15 @@ CIFAR10_CFG = Config(
     dataset="cifar10",
     data_dir="./data",
     img_size=32,
-    patch_size=4,
+    patch_size=2,
     ae_layers=6,
     embed_dim=256,
     num_heads=8,
     query_dim=32,
     value_dim=32,
+    compression_factor=32,
     ffn_dim=512,
+    use_bn=True,
     flow_layers=6,
     flow_embed_dim=256,
     flow_query_dim=32,
@@ -132,7 +135,7 @@ CIFAR10_CFG = Config(
     w_perc_con=1.0,
     w_lat_con=0.1,
     w_flow=1.0,
-    batch_size=1280,
+    batch_size=256,
     lr=6e-4,
     total_steps=100_000,
     ae_warmup_steps=10_000,
@@ -149,7 +152,9 @@ IMAGENET_CFG = Config(
     num_heads=8,
     query_dim=64,
     value_dim=64,
+    compression_factor=16,
     ffn_dim=3072,
+    use_bn=False,
     flow_layers=12,
     flow_embed_dim=768,
     flow_query_dim=64,
@@ -163,10 +168,43 @@ IMAGENET_CFG = Config(
     w_perc_con=1.0,
     w_lat_con=0.5,
     w_flow=1.0,
-    batch_size=128,
+    batch_size=80,
     lr=3e-3,
     total_steps=500_000,
     ae_warmup_steps=10_000,
+    image_every=500,
+)
+
+IMAGENET64_CFG = Config(
+    dataset="64imagenet",
+    data_dir="",
+    img_size=64,
+    patch_size=4,
+    ae_layers=6,
+    embed_dim=512,
+    num_heads=8,
+    query_dim=64,
+    value_dim=64,
+    compression_factor=32,  # @ patch_size = 4 this yields compression ratio 3.0
+    ffn_dim=2048,
+    use_bn=True,
+    flow_layers=8,
+    flow_embed_dim=512,
+    flow_query_dim=64,
+    flow_value_dim=64,
+    flow_ffn_dim=2048,
+    sigma_angle_max=85.0,
+    sigma_mix_max=89.0,
+    w_l1_recon=10.0,
+    w_perc_recon=1.0,
+    w_l1_con=10.0,
+    w_perc_con=1.0,
+    w_lat_con=0.1,
+    w_flow=1.0,
+    batch_size=6,
+    lr=2e-4,
+    total_steps=500_000,
+    ae_warmup_steps=50_000,
     image_every=500,
 )
 
@@ -251,11 +289,14 @@ class SphereAE(nn.Module):
         self.lat = self.num_patches
         self.dim = cfg.embed_dim // cfg.compression_factor
         self.L = self.num_patches * self.dim
+        self.bn = nn.BatchNorm1d(self.L) if cfg.use_bn else None
 
     def encode(self, x: Tensor) -> tuple[Tensor, Tensor]:
         """Returns (z_flat, v): raw flat latent and sphere-projected latent."""
         z = self.enc(self.tok(x))  # (b, lat, dim)
         z_flat = z.reshape(z.shape[0], -1)  # (b, L)
+        if self.bn is not None:
+            z_flat = self.bn(z_flat)
         return z_flat, spherify(z_flat)
 
     def decode(self, v_flat: Tensor) -> tuple[Tensor, Tensor]:
@@ -396,7 +437,7 @@ def get_loader(cfg: Config) -> DataLoader:
     if cfg.dataset == "cifar10":
         tf = T.Compose([T.RandomHorizontalFlip(), T.ToTensor(), T.Normalize([0.5] * 3, [0.5] * 3)])
         ds = torchvision.datasets.CIFAR10(cfg.data_dir, train=True, download=True, transform=tf)
-    elif cfg.dataset == "imagenet":
+    elif cfg.dataset in ("imagenet", "64imagenet"):
         import datasets as hf
 
         tf = T.Compose(
@@ -548,8 +589,9 @@ def train(cfg: Config, run_name: str, use_wandb: bool, save_artifacts: bool = Tr
         adamw.step()
 
         # accumulate metrics every step
+        epoch = step // len(loader)
         logger.train_log(loss=loss.detach(), **info)
-        logger.train_log(lr=torch.tensor(lr), phase=torch.tensor(float(train_flow)))
+        logger.train_log(lr=torch.tensor(lr), phase=torch.tensor(float(train_flow)), epoch=torch.tensor(float(epoch)))
         logger.iter()
 
         if step % cfg.log_every == 0:
@@ -592,7 +634,7 @@ def train(cfg: Config, run_name: str, use_wandb: bool, save_artifacts: bool = Tr
             pbar.write(f"[sphere_flow] ckpt step={step}" + (f"  fid={fid:.2f}" if fid else ""))
 
         phase_str = "ae+flow" if train_flow else "ae"
-        pbar.set_postfix(loss=f"{loss.item():.4f}", phase=phase_str, lr=f"{lr:.2e}")
+        pbar.set_postfix(loss=f"{loss.item():.4f}", phase=phase_str, lr=f"{lr:.2e}", epoch=epoch)
         pbar.update(1)
         step += 1
 
@@ -634,7 +676,7 @@ def run_sweep(count: int):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("dataset", nargs="?", default="cifar10", choices=["cifar10", "imagenet"])
+    parser.add_argument("dataset", nargs="?", default="cifar10", choices=["cifar10", "imagenet", "64imagenet"])
     parser.add_argument("--wandb", action="store_true", help="use WandbLogger instead of console Logger")
     parser.add_argument("--run-name", default=None, help="run name for logging and checkpoints")
     parser.add_argument("--sweep", action="store_true", help="run a wandb LR sweep on cifar10")
@@ -644,6 +686,6 @@ if __name__ == "__main__":
     if args.sweep:
         run_sweep(args.sweep_count)
     else:
-        cfg = CIFAR10_CFG if args.dataset == "cifar10" else IMAGENET_CFG
+        cfg = {"cifar10": CIFAR10_CFG, "imagenet": IMAGENET_CFG, "64imagenet": IMAGENET64_CFG}[args.dataset]
         run_name = args.run_name or f"sphere-flow-{args.dataset}"
         train(cfg, run_name=run_name, use_wandb=args.wandb)

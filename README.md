@@ -1,3 +1,11 @@
+# Quick Visualization
+
+For a quick demo with an 8-dimensional model trained on landscape imagery:
+
+```bash
+uv run latent_explorer.py --wandb-artifact eitreif/sphere-flow/8dim_geir:latest
+```
+
 # Spherical Flow
 
 Implementation of a spherical autoencoder with flow-based refinement for image generation, based on:
@@ -117,3 +125,48 @@ uv run sphere_flow_train.py --sweep --sweep-count 20
 ```
 
 Checkpoints (with optimizer states) are saved to `checkpoints/<run-name>/` every `save_every` steps. FID is computed at each checkpoint.
+
+## Latent Space Explorer
+
+The `latent_explorer.py` script provides an interactive Gradio GUI for exploring the TinyAE latent space. It downloads a trained model from wandb and lets you manipulate each latent dimension with sliders to see how they affect the generated image in real-time.
+
+### Usage
+
+```bash
+uv run latent_explorer.py --wandb-artifact <entity/project/name:version>
+```
+
+For a quick demo with an 8-dimensional model trained on landscape imagery:
+
+```bash
+uv run latent_explorer.py --wandb-artifact eitreif/sphere-flow/8dim_geir:latest
+```
+
+This will:
+
+1. Download the artifact from wandb
+2. Start a local web server (default: http://127.0.0.1:7860)
+3. Open your browser with N sliders (one per latent dimension)
+
+**Controls:**
+
+- Drag sliders (-1 to 1) to adjust the latent vector
+- The raw latent magnitude is shown before spherification
+- **Randomize** — sample random values for all dimensions
+- **Reset** — set all sliders to 0
+
+The latent vector is spherified (normalized to unit sphere) before decoding, following the model's training regime.
+
+### Options
+
+```bash
+uv run latent_explorer.py \
+    --wandb-artifact eitreif/sphere-flow/8dim_geir:latest \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --device cuda
+```
+
+- `--host` — server bind address (default: 127.0.0.1)
+- `--port` — server port (default: 7860)
+- `--device` — torch device: cuda, mps, or cpu (default: auto-detect)

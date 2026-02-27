@@ -27,6 +27,14 @@ def apply_rope(x: Tensor, freqs: Tensor) -> Tensor:
     return out.type_as(x)
 
 
+def make_sinusoidal_pos_emb(num_tokens: int, dim: int) -> Tensor:
+    assert dim % 2 == 0
+    pos = torch.arange(num_tokens, dtype=torch.float32)
+    i = torch.arange(dim // 2, dtype=torch.float32)
+    angles = pos[:, None] / (10000.0 ** (2 * i[None, :] / dim))
+    return torch.cat([angles.sin(), angles.cos()], dim=-1)  # (num_tokens, dim)
+
+
 def init_param(*shape) -> nn.Parameter:
     u = torch.zeros(*shape)
     if len(list(shape)) > 1:
@@ -152,9 +160,9 @@ class Tokenizer(nn.Module):
         self.to_tokens = nn.Linear(bottleneck_dim, embed_dim, bias=False)
         self.out_norm = nn.LayerNorm(embed_dim)
         self.from_tokens = nn.Linear(embed_dim, patch_dim, bias=False)
-        self.positional = init_param(1, num_patches, embed_dim)
+        self.register_buffer("positional", make_sinusoidal_pos_emb(num_patches, embed_dim).unsqueeze(0))
         # Smooth patch boundaries with ResNet block
-        # self.smooth = nn.Conv2d(img_chw[0], img_chw[0], 3, padding=1)
+        self.smooth = nn.Conv2d(img_chw[0], img_chw[0], 3, padding=1)
 
     def num_params(self) -> int:
         total = 0
@@ -176,7 +184,7 @@ class Tokenizer(nn.Module):
         patches = self.from_tokens(tokens)
         patches = rearrange(patches, "b t e -> b e t")
         images = self.fold(patches)
-        # images = self.smooth(images)
+        images = self.smooth(images)
         return images
 
     def forward(self, inputs: Tensor) -> Tensor:
@@ -202,7 +210,7 @@ class Encoder(nn.Module):
         for _ in range(num_layers):
             layers.append(ViTLayer(heads, embed_dim, query_dim, value_dim, ffn_dim))
         self.layers = nn.ModuleList(layers)
-        self.positional_enc = init_param(input_tokens, embed_dim)
+        self.register_buffer("positional_enc", make_sinusoidal_pos_emb(input_tokens, embed_dim))
         self.mixer = MLPMixer(input_tokens, embed_dim)
         self.bottleneck = nn.Linear(embed_dim, embed_dim // compression_factor, bias=False)
 
